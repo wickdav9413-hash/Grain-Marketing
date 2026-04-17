@@ -5,8 +5,11 @@ Fetches recent prices for corn, soybeans, wheat, milk, live cattle (beef),
 lean hogs, and sheep/lamb, computes simple technical indicators, generates
 buy/sell signals and 1-/7-day forecasts, then emails the report.
 
-Data source:  Yahoo Finance (via yfinance) - delayed/end-of-day futures quotes.
-Email:        SMTP (Gmail app password expected).
+Data sources (in priority order):
+  1. Yahoo Finance chart API via requests (direct HTTP)
+  2. yfinance library (fallback)
+
+Email: SMTP (Gmail app password expected).
 
 Environment variables (all required unless noted):
     SMTP_HOST        default: smtp.gmail.com
@@ -21,35 +24,29 @@ simple moving-average / momentum rules. Always do your own research.
 """
 from __future__ import annotations
 
+import json
 import os
 import smtplib
 import ssl
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Optional
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pandas as pd
-import yfinance as yf
 
-
-# ---------------------------------------------------------------------------
-# Instruments to track.
-# ---------------------------------------------------------------------------
-# Note on sheep: there is no actively-traded sheep/lamb futures contract on
-# Yahoo Finance. We use the iShares MSCI New Zealand ETF as a rough proxy for
-# the New Zealand lamb-export economy; it is imperfect but the closest public
-# free data we can pull without a paid subscription. The report clearly labels
-# it as a proxy so the reader is not misled.
 INSTRUMENTS: list[tuple[str, str, str]] = [
-    ("Corn",           "ZC=F", "USD / bushel"),
-    ("Soybeans",       "ZS=F", "USD / bushel"),
-    ("Wheat",          "ZW=F", "USD / bushel"),
+    ("Corn", "ZC=F", "USD / bushel"),
+    ("Soybeans", "ZS=F", "USD / bushel"),
+    ("Wheat", "ZW=F", "USD / bushel"),
     ("Class III Milk", "DC=F", "USD / cwt"),
     ("Live Cattle (Beef)", "LE=F", "USD / lb"),
-    ("Lean Hogs",      "HE=F", "USD / lb"),
-    ("Sheep/Lamb (NZ proxy)", "ENZL", "USD / share"),
+    ("Lean Hogs", "HE=F", "USD / lb"),
+    ("Sheep/Lamb (proxy: Livestock ETF COW)", "COW", "USD / share"),
 ]
 
 
@@ -75,6 +72,76 @@ class InstrumentReport:
 
 
 # ---------------------------------------------------------------------------
+# Data fetching — multiple strategies for resilience.
+# ---------------------------------------------------------------------------
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def _fetch_yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> pd.Series:
+    """Fetch closing prices directly from Yahoo Finance chart API."""
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?range={range_str}&interval={interval}&includePrePost=false"
+    )
+    req = Request(url, headers=_HEADERS)
+    for attempt in range(3):
+        try:
+            with urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            result = data["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            closes = result["indicators"]["quote"][0]["close"]
+            idx = pd.to_datetime(timestamps, unit="s", utc=True)
+            series = pd.Series(closes, index=idx, name="Close", dtype=float).dropna()
+            if series.empty:
+                raise ValueError("empty close series")
+            return series
+        except (HTTPError, KeyError, TypeError, ValueError, Exception) as exc:
+            if attempt < 2:
+                time.sleep(1 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Yahoo chart API failed after 3 attempts: {exc}") from exc
+    raise RuntimeError("unreachable")
+
+
+def _fetch_yfinance(symbol: str) -> pd.Series:
+    """Fallback: use the yfinance library."""
+    import yfinance as yf
+
+    ticker = yf.Ticker(symbol)
+    hist = ticker.history(period="6mo", interval="1d")
+    if hist is None or hist.empty:
+        raise RuntimeError("yfinance returned no data")
+    if "Close" not in hist.columns:
+        raise RuntimeError("yfinance returned no Close column")
+    closes = hist["Close"].dropna()
+    if closes.empty:
+        raise RuntimeError("yfinance Close series is empty")
+    return closes
+
+
+def fetch_closes(symbol: str) -> pd.Series:
+    """Try multiple data sources to get closing prices."""
+    errors = []
+
+    for fetcher_name, fetcher in [
+        ("yahoo_chart_api", _fetch_yahoo_chart),
+        ("yfinance", _fetch_yfinance),
+    ]:
+        try:
+            return fetcher(symbol)
+        except Exception as exc:
+            errors.append(f"{fetcher_name}: {exc}")
+
+    raise RuntimeError(" | ".join(errors))
+
+
+# ---------------------------------------------------------------------------
 # Indicators.
 # ---------------------------------------------------------------------------
 def _rsi(series: pd.Series, period: int = 14) -> Optional[float]:
@@ -94,8 +161,8 @@ def _rsi(series: pd.Series, period: int = 14) -> Optional[float]:
 def _pct_change(series: pd.Series, days: int) -> Optional[float]:
     if len(series) <= days:
         return None
-    old = series.iloc[-1 - days]
-    new = series.iloc[-1]
+    old = float(series.iloc[-1 - days])
+    new = float(series.iloc[-1])
     if old == 0 or pd.isna(old):
         return None
     return float((new - old) / old * 100)
@@ -107,7 +174,6 @@ def _linear_forecast(series: pd.Series, horizon_days: int) -> Optional[float]:
     if len(window) < 5:
         return None
     x = pd.Series(range(len(window)), index=window.index, dtype=float)
-    # slope via least squares
     x_mean = x.mean()
     y_mean = window.mean()
     denom = ((x - x_mean) ** 2).sum()
@@ -131,7 +197,6 @@ def _derive_signal(
     """Return (trend, signal, rationale) from mechanical rules."""
     reasons: list[str] = []
 
-    # Trend
     if sma20 is not None and sma50 is not None:
         if last > sma20 > sma50:
             trend = "Uptrend"
@@ -148,7 +213,6 @@ def _derive_signal(
     else:
         trend = "Unknown"
 
-    # Signal
     signal = "HOLD"
     if rsi is not None:
         if rsi < 30:
@@ -181,16 +245,11 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         rationale="no data", forecast_1d=None, forecast_7d=None,
     )
     try:
-        hist = yf.Ticker(symbol).history(period="6mo", interval="1d", auto_adjust=False)
-    except Exception as exc:  # noqa: BLE001
+        closes = fetch_closes(symbol)
+    except Exception as exc:
         blank.error = f"fetch failed: {exc}"
         return blank
 
-    if hist is None or hist.empty or "Close" not in hist.columns:
-        blank.error = "no history returned"
-        return blank
-
-    closes = hist["Close"].dropna()
     if closes.empty:
         blank.error = "no close prices"
         return blank
@@ -209,8 +268,8 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         last=last,
         prev_close=prev,
         change_pct_1d=_pct_change(closes, 1),
-        change_pct_7d=_pct_change(closes, 5),   # 5 trading days ~ 1 week
-        change_pct_30d=_pct_change(closes, 21), # ~1 month of trading days
+        change_pct_7d=_pct_change(closes, 5),
+        change_pct_30d=_pct_change(closes, 21),
         sma20=sma20,
         sma50=sma50,
         rsi14=rsi14,
@@ -239,22 +298,29 @@ def _badge(signal: str) -> str:
     )
 
 
+def _signal_emoji(signal: str) -> str:
+    return {"BUY": "[BUY]", "SELL": "[SELL]", "HOLD": "[HOLD]"}.get(signal, "[?]")
+
+
 def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
     rows: list[str] = []
     for r in reports:
         if r.error:
             rows.append(
                 f"<tr><td><b>{r.name}</b><br><small>{r.symbol}</small></td>"
-                f"<td colspan=8 style='color:#b42318;'>Data unavailable: {r.error}</td></tr>"
+                f"<td colspan='8' style='color:#b42318;'>Data unavailable: {r.error}</td></tr>"
             )
             continue
+        chg_color_1d = "#1a7f37" if (r.change_pct_1d or 0) >= 0 else "#b42318"
+        chg_color_7d = "#1a7f37" if (r.change_pct_7d or 0) >= 0 else "#b42318"
+        chg_color_30d = "#1a7f37" if (r.change_pct_30d or 0) >= 0 else "#b42318"
         rows.append(
             "<tr>"
             f"<td><b>{r.name}</b><br><small>{r.symbol} &middot; {r.unit}</small></td>"
-            f"<td style='text-align:right;'>{_fmt(r.last)}</td>"
-            f"<td style='text-align:right;'>{_fmt(r.change_pct_1d, 2, '%')}</td>"
-            f"<td style='text-align:right;'>{_fmt(r.change_pct_7d, 2, '%')}</td>"
-            f"<td style='text-align:right;'>{_fmt(r.change_pct_30d, 2, '%')}</td>"
+            f"<td style='text-align:right;font-weight:600;'>{_fmt(r.last)}</td>"
+            f"<td style='text-align:right;color:{chg_color_1d};'>{_fmt(r.change_pct_1d, 2, '%')}</td>"
+            f"<td style='text-align:right;color:{chg_color_7d};'>{_fmt(r.change_pct_7d, 2, '%')}</td>"
+            f"<td style='text-align:right;color:{chg_color_30d};'>{_fmt(r.change_pct_30d, 2, '%')}</td>"
             f"<td style='text-align:right;'>{_fmt(r.rsi14, 0)}</td>"
             f"<td>{r.trend}</td>"
             f"<td>{_badge(r.signal)}</td>"
@@ -267,6 +333,12 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
     for r in reports:
         if r.error:
             continue
+        fc_1d_direction = ""
+        if r.forecast_1d is not None and r.last is not None:
+            fc_1d_direction = " (higher)" if r.forecast_1d > r.last else " (lower)"
+        fc_7d_direction = ""
+        if r.forecast_7d is not None and r.last is not None:
+            fc_7d_direction = " (higher)" if r.forecast_7d > r.last else " (lower)"
         details.append(
             f"<h3 style='margin-bottom:4px;'>{r.name} &mdash; {_badge(r.signal)}</h3>"
             f"<p style='margin-top:0;color:#444;'>"
@@ -275,18 +347,28 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
             f"<b>Last:</b> {_fmt(r.last)} {r.unit} &nbsp;"
             f"<b>SMA20:</b> {_fmt(r.sma20)} &nbsp;"
             f"<b>SMA50:</b> {_fmt(r.sma50)}<br>"
-            f"<b>1-day forecast:</b> {_fmt(r.forecast_1d)} &nbsp;"
-            f"<b>7-day forecast:</b> {_fmt(r.forecast_7d)}"
+            f"<b>1-day forecast:</b> {_fmt(r.forecast_1d)}{fc_1d_direction} &nbsp;"
+            f"<b>7-day forecast:</b> {_fmt(r.forecast_7d)}{fc_7d_direction}"
             f"</p>"
+        )
+
+    error_count = sum(1 for r in reports if r.error)
+    status_note = ""
+    if error_count > 0:
+        status_note = (
+            f"<p style='color:#b42318;font-weight:600;'>"
+            f"Warning: {error_count} instrument(s) could not be fetched. "
+            f"See details below.</p>"
         )
 
     return f"""\
 <!doctype html>
-<html><body style="font-family:Arial,Helvetica,sans-serif;color:#222;">
+<html><body style="font-family:Arial,Helvetica,sans-serif;color:#222;max-width:900px;margin:auto;">
   <h2 style="margin-bottom:0;">Daily Grain &amp; Livestock Report</h2>
   <p style="margin-top:4px;color:#666;">
-    Generated {run_ts.strftime('%Y-%m-%d %H:%M UTC')}
+    Generated {run_ts.strftime('%A, %B %d, %Y at %H:%M UTC')}
   </p>
+  {status_note}
 
   <table cellpadding="6" cellspacing="0" border="0"
          style="border-collapse:collapse;width:100%;font-size:13px;">
@@ -306,17 +388,17 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
     <tbody>{''.join(rows)}</tbody>
   </table>
 
-  <h3 style="margin-top:24px;">Commentary &amp; Strategy</h3>
+  <h3 style="margin-top:24px;">Detailed Analysis &amp; Strategy</h3>
   {''.join(details)}
 
   <hr>
   <p style="color:#888;font-size:11px;">
     Prices are end-of-day from Yahoo Finance and may be delayed.
-    Signals come from simple moving-average / RSI rules; forecasts are
+    Signals are based on simple SMA crossover and RSI(14) rules; forecasts are
     linear extrapolations of the last 20 closes. This is an automated
-    summary, not financial advice. Do your own research before trading.
-    Sheep/Lamb uses the iShares MSCI New Zealand ETF (ENZL) as a proxy
-    because no public sheep futures contract is available.
+    summary, <b>not financial advice</b>. Do your own research before trading.
+    Sheep/Lamb uses the iPath Bloomberg Livestock ETN (COW) as a proxy
+    because no public sheep futures contract is available on Yahoo Finance.
   </p>
 </body></html>
 """
@@ -324,31 +406,43 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
 
 def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
     lines = [
-        "Daily Grain & Livestock Report",
-        f"Generated {run_ts.strftime('%Y-%m-%d %H:%M UTC')}",
+        "=" * 60,
+        "   Daily Grain & Livestock Report",
+        f"   Generated {run_ts.strftime('%A, %B %d, %Y at %H:%M UTC')}",
+        "=" * 60,
         "",
     ]
     for r in reports:
         if r.error:
-            lines.append(f"{r.name} ({r.symbol}): data unavailable - {r.error}")
+            lines.append(f"  {r.name} ({r.symbol}): DATA UNAVAILABLE - {r.error}")
+            lines.append("")
             continue
+        fc_1d_dir = ""
+        if r.forecast_1d is not None and r.last is not None:
+            fc_1d_dir = " (higher)" if r.forecast_1d > r.last else " (lower)"
+        fc_7d_dir = ""
+        if r.forecast_7d is not None and r.last is not None:
+            fc_7d_dir = " (higher)" if r.forecast_7d > r.last else " (lower)"
         lines += [
-            f"== {r.name} ({r.symbol}) ==",
-            f"  Last:       {_fmt(r.last)} {r.unit}",
-            f"  Changes:    1d {_fmt(r.change_pct_1d, 2, '%')}  "
-            f"7d {_fmt(r.change_pct_7d, 2, '%')}  "
+            f"--- {r.name} ({r.symbol}) {_signal_emoji(r.signal)} ---",
+            f"  Last Price: {_fmt(r.last)} {r.unit}",
+            f"  Changes:    1d {_fmt(r.change_pct_1d, 2, '%')}  |  "
+            f"7d {_fmt(r.change_pct_7d, 2, '%')}  |  "
             f"30d {_fmt(r.change_pct_30d, 2, '%')}",
             f"  SMA20/50:   {_fmt(r.sma20)} / {_fmt(r.sma50)}",
             f"  RSI(14):    {_fmt(r.rsi14, 0)}",
             f"  Trend:      {r.trend}",
             f"  Signal:     {r.signal}  ({r.rationale})",
-            f"  Forecast:   1d {_fmt(r.forecast_1d)}  7d {_fmt(r.forecast_7d)}",
+            f"  Forecast:   1d -> {_fmt(r.forecast_1d)}{fc_1d_dir}  |  "
+            f"7d -> {_fmt(r.forecast_7d)}{fc_7d_dir}",
             "",
         ]
-    lines.append(
-        "Automated summary from Yahoo Finance end-of-day data. "
-        "Not financial advice."
-    )
+    lines += [
+        "-" * 60,
+        "Prices from Yahoo Finance (end-of-day, may be delayed).",
+        "Signals use SMA crossover + RSI rules. NOT financial advice.",
+        "-" * 60,
+    ]
     return "\n".join(lines)
 
 
@@ -387,7 +481,20 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
 # ---------------------------------------------------------------------------
 def main() -> int:
     run_ts = datetime.now(timezone.utc)
-    reports = [analyze(name, symbol, unit) for name, symbol, unit in INSTRUMENTS]
+    print(f"Fetching data for {len(INSTRUMENTS)} instruments...")
+
+    reports = []
+    for name, symbol, unit in INSTRUMENTS:
+        print(f"  Fetching {name} ({symbol})...", end=" ", flush=True)
+        report = analyze(name, symbol, unit)
+        if report.error:
+            print(f"FAILED: {report.error}")
+        else:
+            print(f"OK - {_fmt(report.last)} {unit}")
+        reports.append(report)
+
+    success_count = sum(1 for r in reports if not r.error)
+    print(f"\nResults: {success_count}/{len(reports)} instruments fetched successfully.\n")
 
     text_body = render_text(reports, run_ts)
     html_body = render_html(reports, run_ts)
@@ -399,8 +506,12 @@ def main() -> int:
         print("\nDRY_RUN set; skipping email send.")
         return 0
 
+    if success_count == 0:
+        print("\nERROR: All instruments failed to fetch. Not sending empty report.")
+        return 1
+
     send_email(subject, text_body, html_body)
-    print("\nEmail sent.")
+    print("\nEmail sent successfully.")
     return 0
 
 

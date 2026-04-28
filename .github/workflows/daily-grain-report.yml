@@ -29,14 +29,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
+          python -c "import pandas; print(f'pandas {pandas.__version__}')"
+          python -c "import yfinance; print(f'yfinance {yfinance.__version__}')"
+          python -c "import requests; print(f'requests {requests.__version__}')"
 
       - name: Send daily report
         env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST || 'smtp.gmail.com' }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO || 'wickdav9413@gmail.com' }}
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python grain_report.py

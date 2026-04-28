@@ -6,8 +6,9 @@ lean hogs, and sheep/lamb, computes simple technical indicators, generates
 buy/sell signals and 1-/7-day forecasts, then emails the report.
 
 Data sources (in priority order):
-  1. Yahoo Finance chart API via requests (direct HTTP)
+  1. Yahoo Finance chart API via requests (with cookie/crumb auth)
   2. yfinance library (fallback)
+  3. Yahoo Finance CSV download endpoint (last resort)
 
 Email: SMTP (Gmail app password expected).
 
@@ -24,7 +25,7 @@ simple moving-average / momentum rules. Always do your own research.
 """
 from __future__ import annotations
 
-import json
+import io
 import os
 import smtplib
 import ssl
@@ -34,10 +35,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Optional
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 
 import pandas as pd
+import requests as _requests
 
 INSTRUMENTS: list[tuple[str, str, str]] = [
     ("Corn", "ZC=F", "USD / bushel"),
@@ -72,27 +72,65 @@ class InstrumentReport:
 
 
 # ---------------------------------------------------------------------------
-# Data fetching — multiple strategies for resilience.
+# Yahoo Finance authenticated session (cookie + crumb).
 # ---------------------------------------------------------------------------
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
 }
 
+_yahoo_session: Optional[_requests.Session] = None
+_yahoo_crumb: Optional[str] = None
 
-def _fetch_yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> pd.Series:
-    """Fetch closing prices directly from Yahoo Finance chart API."""
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?range={range_str}&interval={interval}&includePrePost=false"
-    )
-    req = Request(url, headers=_HEADERS)
+
+def _init_yahoo_session() -> tuple[_requests.Session, str]:
+    """Create an authenticated Yahoo Finance session with cookie + crumb."""
+    global _yahoo_session, _yahoo_crumb
+    if _yahoo_session is not None and _yahoo_crumb is not None:
+        return _yahoo_session, _yahoo_crumb
+
+    session = _requests.Session()
+    session.headers.update(_HEADERS)
+
     for attempt in range(3):
         try:
-            with urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
+            session.get("https://fc.yahoo.com", timeout=10, allow_redirects=True)
+            crumb_resp = session.get(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb",
+                timeout=10,
+            )
+            crumb_resp.raise_for_status()
+            crumb = crumb_resp.text.strip()
+            if not crumb:
+                raise RuntimeError("empty crumb")
+            _yahoo_session = session
+            _yahoo_crumb = crumb
+            return session, crumb
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Yahoo session init failed after 3 attempts: {exc}") from exc
+    raise RuntimeError("unreachable")
+
+
+# ---------------------------------------------------------------------------
+# Data fetching — multiple strategies for resilience.
+# ---------------------------------------------------------------------------
+def _fetch_yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> pd.Series:
+    """Fetch closing prices from Yahoo Finance chart API with proper auth."""
+    session, crumb = _init_yahoo_session()
+    url = (
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?range={range_str}&interval={interval}&includePrePost=false&crumb={crumb}"
+    )
+    for attempt in range(3):
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
             result = data["chart"]["result"][0]
             timestamps = result["timestamp"]
             closes = result["indicators"]["quote"][0]["close"]
@@ -101,9 +139,9 @@ def _fetch_yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d"
             if series.empty:
                 raise ValueError("empty close series")
             return series
-        except (HTTPError, KeyError, TypeError, ValueError, Exception) as exc:
+        except Exception as exc:
             if attempt < 2:
-                time.sleep(1 * (attempt + 1))
+                time.sleep(2 * (attempt + 1))
                 continue
             raise RuntimeError(f"Yahoo chart API failed after 3 attempts: {exc}") from exc
     raise RuntimeError("unreachable")
@@ -125,6 +163,35 @@ def _fetch_yfinance(symbol: str) -> pd.Series:
     return closes
 
 
+def _fetch_yahoo_csv(symbol: str) -> pd.Series:
+    """Last-resort fallback: Yahoo Finance CSV download endpoint."""
+    session, crumb = _init_yahoo_session()
+    now = int(time.time())
+    period1 = now - (180 * 86400)
+    url = (
+        f"https://query2.finance.yahoo.com/v7/finance/download/{symbol}"
+        f"?period1={period1}&period2={now}&interval=1d&events=history&crumb={crumb}"
+    )
+    for attempt in range(3):
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text), parse_dates=["Date"])
+            if df.empty or "Close" not in df.columns:
+                raise RuntimeError("CSV returned no Close data")
+            df = df.set_index("Date").sort_index()
+            closes = df["Close"].dropna()
+            if closes.empty:
+                raise RuntimeError("CSV Close series is empty")
+            return closes
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Yahoo CSV download failed after 3 attempts: {exc}") from exc
+    raise RuntimeError("unreachable")
+
+
 def fetch_closes(symbol: str) -> pd.Series:
     """Try multiple data sources to get closing prices."""
     errors = []
@@ -132,9 +199,12 @@ def fetch_closes(symbol: str) -> pd.Series:
     for fetcher_name, fetcher in [
         ("yahoo_chart_api", _fetch_yahoo_chart),
         ("yfinance", _fetch_yfinance),
+        ("yahoo_csv", _fetch_yahoo_csv),
     ]:
         try:
-            return fetcher(symbol)
+            series = fetcher(symbol)
+            print(f"[{fetcher_name}]", end=" ", flush=True)
+            return series
         except Exception as exc:
             errors.append(f"{fetcher_name}: {exc}")
 
@@ -450,17 +520,21 @@ def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
 # Email.
 # ---------------------------------------------------------------------------
 def send_email(subject: str, text_body: str, html_body: str) -> None:
-    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    username = os.environ.get("SMTP_USERNAME")
-    password = os.environ.get("SMTP_PASSWORD")
-    email_from = os.environ.get("EMAIL_FROM", username)
-    email_to = os.environ.get("EMAIL_TO", "wickdav9413@gmail.com")
+    host = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
+    port = int(os.environ.get("SMTP_PORT") or "587")
+    username = os.environ.get("SMTP_USERNAME") or ""
+    password = os.environ.get("SMTP_PASSWORD") or ""
+    email_from = os.environ.get("EMAIL_FROM") or username
+    email_to = os.environ.get("EMAIL_TO") or "wickdav9413@gmail.com"
 
     if not username or not password:
         raise RuntimeError(
-            "SMTP_USERNAME and SMTP_PASSWORD must be set (use a Gmail App Password)."
+            "SMTP_USERNAME and SMTP_PASSWORD must be set (use a Gmail App Password).\n"
+            "Set these as GitHub repository secrets under Settings > Secrets and variables > Actions."
         )
+
+    if not email_from:
+        email_from = username
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -482,16 +556,30 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
 def main() -> int:
     run_ts = datetime.now(timezone.utc)
     print(f"Fetching data for {len(INSTRUMENTS)} instruments...")
+    print(f"Run time: {run_ts.isoformat()}")
+    print()
+
+    # Initialize Yahoo session once before fetching instruments.
+    try:
+        print("Initializing Yahoo Finance session...", end=" ", flush=True)
+        _init_yahoo_session()
+        print("OK")
+    except Exception as exc:
+        print(f"WARNING: {exc}")
+        print("Will rely on yfinance library fallback.\n")
 
     reports = []
-    for name, symbol, unit in INSTRUMENTS:
-        print(f"  Fetching {name} ({symbol})...", end=" ", flush=True)
+    for i, (name, symbol, unit) in enumerate(INSTRUMENTS):
+        print(f"  [{i+1}/{len(INSTRUMENTS)}] {name} ({symbol})...", end=" ", flush=True)
         report = analyze(name, symbol, unit)
         if report.error:
             print(f"FAILED: {report.error}")
         else:
             print(f"OK - {_fmt(report.last)} {unit}")
         reports.append(report)
+        # Rate-limit: pause between instruments to avoid Yahoo throttling.
+        if i < len(INSTRUMENTS) - 1:
+            time.sleep(1.5)
 
     success_count = sum(1 for r in reports if not r.error)
     print(f"\nResults: {success_count}/{len(reports)} instruments fetched successfully.\n")
@@ -510,8 +598,14 @@ def main() -> int:
         print("\nERROR: All instruments failed to fetch. Not sending empty report.")
         return 1
 
-    send_email(subject, text_body, html_body)
-    print("\nEmail sent successfully.")
+    try:
+        send_email(subject, text_body, html_body)
+        print("\nEmail sent successfully.")
+    except Exception as exc:
+        print(f"\nERROR sending email: {exc}")
+        print("The report was printed above. Check SMTP_USERNAME and SMTP_PASSWORD secrets.")
+        return 1
+
     return 0
 
 

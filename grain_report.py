@@ -522,19 +522,17 @@ def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
 def send_email(subject: str, text_body: str, html_body: str) -> None:
     host = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
     port = int(os.environ.get("SMTP_PORT") or "587")
-    username = os.environ.get("SMTP_USERNAME") or ""
-    password = os.environ.get("SMTP_PASSWORD") or ""
-    email_from = os.environ.get("EMAIL_FROM") or username
-    email_to = os.environ.get("EMAIL_TO") or "wickdav9413@gmail.com"
+    # Strip whitespace — a common mistake when pasting App Passwords into secrets.
+    username = (os.environ.get("SMTP_USERNAME") or "").strip()
+    password = (os.environ.get("SMTP_PASSWORD") or "").strip().replace(" ", "")
+    email_from = (os.environ.get("EMAIL_FROM") or "").strip() or username
+    email_to = (os.environ.get("EMAIL_TO") or "wickdav9413@gmail.com").strip()
 
     if not username or not password:
         raise RuntimeError(
             "SMTP_USERNAME and SMTP_PASSWORD must be set (use a Gmail App Password).\n"
             "Set these as GitHub repository secrets under Settings > Secrets and variables > Actions."
         )
-
-    if not email_from:
-        email_from = username
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -544,10 +542,26 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
     msg.add_alternative(html_body, subtype="html")
 
     context = ssl.create_default_context()
-    with smtplib.SMTP(host, port) as server:
-        server.starttls(context=context)
+
+    # Port 465 uses implicit TLS (SMTP_SSL); port 587 uses STARTTLS.
+    # Avoid the smtplib context manager: if QUIT raises after send, it can mask the real error.
+    if port == 465:
+        server: smtplib.SMTP = smtplib.SMTP_SSL(host, port, context=context, timeout=30)
+    else:
+        server = smtplib.SMTP(host, port, timeout=30)
+
+    try:
+        if port != 465:
+            # RFC 3207: re-send EHLO after STARTTLS so the server re-advertises capabilities.
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
         server.login(username, password)
         server.send_message(msg)
+        server.quit()
+    except Exception:
+        server.close()
+        raise
 
 
 # ---------------------------------------------------------------------------

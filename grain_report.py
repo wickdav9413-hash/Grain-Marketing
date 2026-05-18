@@ -2,8 +2,8 @@
 Daily Grain & Livestock Market Report.
 
 Fetches recent prices for corn, soybeans, wheat, milk, live cattle (beef),
-lean hogs, and sheep/lamb, computes simple technical indicators, generates
-buy/sell signals and 1-/7-day forecasts, then emails the report.
+lean hogs, and sheep/lamb, computes technical indicators (SMA, RSI, MACD),
+generates buy/sell signals and 1-/7-day forecasts, then emails the report.
 
 Data sources (in priority order):
   1. Yahoo Finance chart API via requests (with cookie/crumb auth)
@@ -33,7 +33,6 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from typing import Optional
 
 import pandas as pd
@@ -63,11 +62,18 @@ class InstrumentReport:
     sma20: Optional[float]
     sma50: Optional[float]
     rsi14: Optional[float]
+    macd_line: Optional[float]
+    macd_signal: Optional[float]
+    macd_histogram: Optional[float]
     trend: str
     signal: str
+    signal_strength: str
     rationale: str
+    strategy: str
     forecast_1d: Optional[float]
     forecast_7d: Optional[float]
+    forecast_1d_pct: Optional[float]
+    forecast_7d_pct: Optional[float]
     error: Optional[str] = None
 
 
@@ -86,7 +92,6 @@ _yahoo_crumb: Optional[str] = None
 
 
 def _init_yahoo_session() -> tuple[_requests.Session, str]:
-    """Create an authenticated Yahoo Finance session with cookie + crumb."""
     global _yahoo_session, _yahoo_crumb
     if _yahoo_session is not None and _yahoo_crumb is not None:
         return _yahoo_session, _yahoo_crumb
@@ -120,7 +125,6 @@ def _init_yahoo_session() -> tuple[_requests.Session, str]:
 # Data fetching — multiple strategies for resilience.
 # ---------------------------------------------------------------------------
 def _fetch_yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> pd.Series:
-    """Fetch closing prices from Yahoo Finance chart API with proper auth."""
     session, crumb = _init_yahoo_session()
     url = (
         f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -148,7 +152,6 @@ def _fetch_yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d"
 
 
 def _fetch_yfinance(symbol: str) -> pd.Series:
-    """Fallback: use the yfinance library."""
     import yfinance as yf
 
     ticker = yf.Ticker(symbol)
@@ -164,7 +167,6 @@ def _fetch_yfinance(symbol: str) -> pd.Series:
 
 
 def _fetch_yahoo_csv(symbol: str) -> pd.Series:
-    """Last-resort fallback: Yahoo Finance CSV download endpoint."""
     session, crumb = _init_yahoo_session()
     now = int(time.time())
     period1 = now - (180 * 86400)
@@ -193,9 +195,7 @@ def _fetch_yahoo_csv(symbol: str) -> pd.Series:
 
 
 def fetch_closes(symbol: str) -> pd.Series:
-    """Try multiple data sources to get closing prices."""
     errors = []
-
     for fetcher_name, fetcher in [
         ("yahoo_chart_api", _fetch_yahoo_chart),
         ("yfinance", _fetch_yfinance),
@@ -228,6 +228,17 @@ def _rsi(series: pd.Series, period: int = 14) -> Optional[float]:
     return float(100 - (100 / (1 + rs)))
 
 
+def _macd(series: pd.Series) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    if len(series) < 35:
+        return None, None, None
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(histogram.iloc[-1])
+
+
 def _pct_change(series: pd.Series, days: int) -> Optional[float]:
     if len(series) <= days:
         return None
@@ -239,7 +250,6 @@ def _pct_change(series: pd.Series, days: int) -> Optional[float]:
 
 
 def _linear_forecast(series: pd.Series, horizon_days: int) -> Optional[float]:
-    """Linear-regression extrapolation over the last 20 closes."""
     window = series.dropna().tail(20)
     if len(window) < 5:
         return None
@@ -263,46 +273,140 @@ def _derive_signal(
     sma20: Optional[float],
     sma50: Optional[float],
     rsi: Optional[float],
-) -> tuple[str, str, str]:
-    """Return (trend, signal, rationale) from mechanical rules."""
+    macd_hist: Optional[float],
+) -> tuple[str, str, str, str, str]:
+    """Return (trend, signal, strength, rationale, strategy)."""
     reasons: list[str] = []
+    bullish_points = 0
+    bearish_points = 0
 
     if sma20 is not None and sma50 is not None:
         if last > sma20 > sma50:
             trend = "Uptrend"
             reasons.append("price > SMA20 > SMA50")
+            bullish_points += 2
         elif last < sma20 < sma50:
             trend = "Downtrend"
             reasons.append("price < SMA20 < SMA50")
+            bearish_points += 2
         elif last > sma50:
             trend = "Weak uptrend"
             reasons.append("price above SMA50")
+            bullish_points += 1
         else:
             trend = "Weak downtrend"
             reasons.append("price below SMA50")
+            bearish_points += 1
     else:
         trend = "Unknown"
 
-    signal = "HOLD"
     if rsi is not None:
         if rsi < 30:
-            signal = "BUY"
+            bullish_points += 2
             reasons.append(f"RSI {rsi:.0f} (oversold)")
+        elif rsi < 40:
+            bullish_points += 1
+            reasons.append(f"RSI {rsi:.0f} (approaching oversold)")
         elif rsi > 70:
-            signal = "SELL"
+            bearish_points += 2
             reasons.append(f"RSI {rsi:.0f} (overbought)")
+        elif rsi > 60:
+            bearish_points += 1
+            reasons.append(f"RSI {rsi:.0f} (approaching overbought)")
         else:
             reasons.append(f"RSI {rsi:.0f} (neutral)")
 
-    if signal == "HOLD" and sma20 is not None and sma50 is not None:
-        if sma20 > sma50 and last > sma20:
-            signal = "BUY"
-            reasons.append("bullish SMA crossover with price above SMA20")
-        elif sma20 < sma50 and last < sma20:
-            signal = "SELL"
-            reasons.append("bearish SMA crossover with price below SMA20")
+    if macd_hist is not None:
+        if macd_hist > 0:
+            bullish_points += 1
+            reasons.append("MACD histogram positive (bullish momentum)")
+        else:
+            bearish_points += 1
+            reasons.append("MACD histogram negative (bearish momentum)")
 
-    return trend, signal, "; ".join(reasons) if reasons else "insufficient data"
+    score = bullish_points - bearish_points
+    if score >= 3:
+        signal = "BUY"
+        strength = "Strong"
+    elif score >= 1:
+        signal = "BUY"
+        strength = "Moderate"
+    elif score <= -3:
+        signal = "SELL"
+        strength = "Strong"
+    elif score <= -1:
+        signal = "SELL"
+        strength = "Moderate"
+    else:
+        signal = "HOLD"
+        strength = "Neutral"
+
+    strategy = _build_strategy(signal, strength, trend, rsi, macd_hist, last, sma20, sma50)
+
+    return trend, signal, strength, "; ".join(reasons) if reasons else "insufficient data", strategy
+
+
+def _build_strategy(
+    signal: str,
+    strength: str,
+    trend: str,
+    rsi: Optional[float],
+    macd_hist: Optional[float],
+    last: float,
+    sma20: Optional[float],
+    sma50: Optional[float],
+) -> str:
+    parts: list[str] = []
+
+    if signal == "BUY":
+        if strength == "Strong":
+            parts.append(
+                "STRONG BUY signal. Multiple indicators align bullish. "
+                "Consider entering long positions or adding to existing ones."
+            )
+        else:
+            parts.append(
+                "Moderate BUY signal. Conditions are leaning bullish but not unanimous. "
+                "Consider scaling into a position rather than going all-in."
+            )
+        if sma20 is not None and last < sma20:
+            parts.append(f"Price is below the 20-day SMA ({sma20:.2f}), which may act as near-term resistance.")
+        if rsi is not None and rsi < 35:
+            parts.append("RSI is in oversold territory, suggesting a potential bounce is due.")
+
+    elif signal == "SELL":
+        if strength == "Strong":
+            parts.append(
+                "STRONG SELL signal. Multiple indicators align bearish. "
+                "Consider reducing exposure or hedging with puts/shorts."
+            )
+        else:
+            parts.append(
+                "Moderate SELL signal. Conditions are leaning bearish. "
+                "Consider tightening stops or scaling out of long positions."
+            )
+        if sma50 is not None and last > sma50:
+            parts.append(f"Price is still above the 50-day SMA ({sma50:.2f}), so the longer-term trend hasn't fully broken.")
+        if rsi is not None and rsi > 65:
+            parts.append("RSI is elevated, suggesting upside momentum is fading.")
+
+    else:
+        parts.append(
+            "HOLD / wait for clearer direction. Indicators are mixed. "
+            "Avoid new entries until a stronger signal emerges."
+        )
+        if sma20 is not None and sma50 is not None:
+            gap_pct = abs(sma20 - sma50) / sma50 * 100
+            if gap_pct < 1.5:
+                parts.append(
+                    "SMA20 and SMA50 are very close together, suggesting a potential breakout or breakdown is near."
+                )
+
+    if macd_hist is not None:
+        if abs(macd_hist) < 0.5:
+            parts.append("MACD is near the zero line; watch for a crossover to confirm the next move.")
+
+    return " ".join(parts)
 
 
 def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
@@ -311,8 +415,11 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         last=None, prev_close=None,
         change_pct_1d=None, change_pct_7d=None, change_pct_30d=None,
         sma20=None, sma50=None, rsi14=None,
-        trend="Unknown", signal="HOLD",
-        rationale="no data", forecast_1d=None, forecast_7d=None,
+        macd_line=None, macd_signal=None, macd_histogram=None,
+        trend="Unknown", signal="HOLD", signal_strength="Neutral",
+        rationale="no data", strategy="No data available.",
+        forecast_1d=None, forecast_7d=None,
+        forecast_1d_pct=None, forecast_7d_pct=None,
     )
     try:
         closes = fetch_closes(symbol)
@@ -329,7 +436,14 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
     sma20 = float(closes.tail(20).mean()) if len(closes) >= 20 else None
     sma50 = float(closes.tail(50).mean()) if len(closes) >= 50 else None
     rsi14 = _rsi(closes)
-    trend, signal, rationale = _derive_signal(last, sma20, sma50, rsi14)
+    macd_l, macd_s, macd_h = _macd(closes)
+    trend, signal, strength, rationale = _derive_signal(last, sma20, sma50, rsi14, macd_h)[:4]
+    trend, signal, strength, rationale, strategy = _derive_signal(last, sma20, sma50, rsi14, macd_h)
+
+    fc_1d = _linear_forecast(closes, 1)
+    fc_7d = _linear_forecast(closes, 5)
+    fc_1d_pct = ((fc_1d - last) / last * 100) if fc_1d is not None and last else None
+    fc_7d_pct = ((fc_7d - last) / last * 100) if fc_7d is not None and last else None
 
     return InstrumentReport(
         name=name,
@@ -343,11 +457,18 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         sma20=sma20,
         sma50=sma50,
         rsi14=rsi14,
+        macd_line=macd_l,
+        macd_signal=macd_s,
+        macd_histogram=macd_h,
         trend=trend,
         signal=signal,
+        signal_strength=strength,
         rationale=rationale,
-        forecast_1d=_linear_forecast(closes, 1),
-        forecast_7d=_linear_forecast(closes, 5),
+        strategy=strategy,
+        forecast_1d=fc_1d,
+        forecast_7d=fc_7d,
+        forecast_1d_pct=fc_1d_pct,
+        forecast_7d_pct=fc_7d_pct,
     )
 
 
@@ -368,34 +489,79 @@ def _badge(signal: str) -> str:
     )
 
 
+def _strength_color(strength: str) -> str:
+    return {"Strong": "#d4380d", "Moderate": "#d48806", "Neutral": "#6c6c6c"}.get(strength, "#6c6c6c")
+
+
 def _signal_emoji(signal: str) -> str:
     return {"BUY": "[BUY]", "SELL": "[SELL]", "HOLD": "[HOLD]"}.get(signal, "[?]")
 
 
+def _arrow(pct: Optional[float]) -> str:
+    if pct is None:
+        return ""
+    return "&#9650;" if pct >= 0 else "&#9660;"
+
+
 def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
+    buy_count = sum(1 for r in reports if r.signal == "BUY" and not r.error)
+    sell_count = sum(1 for r in reports if r.signal == "SELL" and not r.error)
+    hold_count = sum(1 for r in reports if r.signal == "HOLD" and not r.error)
+    error_count = sum(1 for r in reports if r.error)
+
+    market_mood = "Mixed"
+    mood_color = "#6c6c6c"
+    if buy_count > sell_count + hold_count:
+        market_mood = "Bullish"
+        mood_color = "#1a7f37"
+    elif sell_count > buy_count + hold_count:
+        market_mood = "Bearish"
+        mood_color = "#b42318"
+    elif buy_count > sell_count:
+        market_mood = "Leaning Bullish"
+        mood_color = "#389e0d"
+    elif sell_count > buy_count:
+        market_mood = "Leaning Bearish"
+        mood_color = "#cf1322"
+
+    summary_html = f"""
+    <div style="background:#f8f9fa;border-radius:8px;padding:16px;margin-bottom:20px;border-left:4px solid {mood_color};">
+      <h3 style="margin:0 0 8px 0;color:{mood_color};">Market Overview: {market_mood}</h3>
+      <p style="margin:0;color:#444;font-size:14px;">
+        <b>{buy_count}</b> BUY &nbsp;|&nbsp; <b>{hold_count}</b> HOLD &nbsp;|&nbsp; <b>{sell_count}</b> SELL
+        {f' &nbsp;|&nbsp; <span style="color:#b42318;">{error_count} unavailable</span>' if error_count else ''}
+      </p>
+    </div>
+    """
+
     rows: list[str] = []
     for r in reports:
         if r.error:
             rows.append(
                 f"<tr><td><b>{r.name}</b><br><small>{r.symbol}</small></td>"
-                f"<td colspan='8' style='color:#b42318;'>Data unavailable: {r.error}</td></tr>"
+                f"<td colspan='9' style='color:#b42318;'>Data unavailable: {r.error}</td></tr>"
             )
             continue
         chg_color_1d = "#1a7f37" if (r.change_pct_1d or 0) >= 0 else "#b42318"
         chg_color_7d = "#1a7f37" if (r.change_pct_7d or 0) >= 0 else "#b42318"
-        chg_color_30d = "#1a7f37" if (r.change_pct_30d or 0) >= 0 else "#b42318"
+        fc_1d_color = "#1a7f37" if (r.forecast_1d_pct or 0) >= 0 else "#b42318"
+        fc_7d_color = "#1a7f37" if (r.forecast_7d_pct or 0) >= 0 else "#b42318"
         rows.append(
             "<tr>"
             f"<td><b>{r.name}</b><br><small>{r.symbol} &middot; {r.unit}</small></td>"
             f"<td style='text-align:right;font-weight:600;'>{_fmt(r.last)}</td>"
             f"<td style='text-align:right;color:{chg_color_1d};'>{_fmt(r.change_pct_1d, 2, '%')}</td>"
             f"<td style='text-align:right;color:{chg_color_7d};'>{_fmt(r.change_pct_7d, 2, '%')}</td>"
-            f"<td style='text-align:right;color:{chg_color_30d};'>{_fmt(r.change_pct_30d, 2, '%')}</td>"
             f"<td style='text-align:right;'>{_fmt(r.rsi14, 0)}</td>"
             f"<td>{r.trend}</td>"
-            f"<td>{_badge(r.signal)}</td>"
-            f"<td style='text-align:right;'>{_fmt(r.forecast_1d)}<br>"
-            f"<small>{_fmt(r.forecast_7d)} (7d)</small></td>"
+            f"<td>{_badge(r.signal)}<br>"
+            f"<small style='color:{_strength_color(r.signal_strength)};'>{r.signal_strength}</small></td>"
+            f"<td style='text-align:right;color:{fc_1d_color};'>"
+            f"{_arrow(r.forecast_1d_pct)} {_fmt(r.forecast_1d)}<br>"
+            f"<small>({_fmt(r.forecast_1d_pct, 2, '%')})</small></td>"
+            f"<td style='text-align:right;color:{fc_7d_color};'>"
+            f"{_arrow(r.forecast_7d_pct)} {_fmt(r.forecast_7d)}<br>"
+            f"<small>({_fmt(r.forecast_7d_pct, 2, '%')})</small></td>"
             "</tr>"
         )
 
@@ -403,26 +569,44 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
     for r in reports:
         if r.error:
             continue
-        fc_1d_direction = ""
-        if r.forecast_1d is not None and r.last is not None:
-            fc_1d_direction = " (higher)" if r.forecast_1d > r.last else " (lower)"
-        fc_7d_direction = ""
-        if r.forecast_7d is not None and r.last is not None:
-            fc_7d_direction = " (higher)" if r.forecast_7d > r.last else " (lower)"
+
+        signal_bg = {"BUY": "#f6ffed", "SELL": "#fff2f0", "HOLD": "#fafafa"}.get(r.signal, "#fafafa")
+        signal_border = {"BUY": "#b7eb8f", "SELL": "#ffa39e", "HOLD": "#d9d9d9"}.get(r.signal, "#d9d9d9")
+
+        fc_1d_dir = ""
+        if r.forecast_1d_pct is not None:
+            fc_1d_dir = f" ({'+' if r.forecast_1d_pct >= 0 else ''}{r.forecast_1d_pct:.2f}%)"
+        fc_7d_dir = ""
+        if r.forecast_7d_pct is not None:
+            fc_7d_dir = f" ({'+' if r.forecast_7d_pct >= 0 else ''}{r.forecast_7d_pct:.2f}%)"
+
         details.append(
-            f"<h3 style='margin-bottom:4px;'>{r.name} &mdash; {_badge(r.signal)}</h3>"
-            f"<p style='margin-top:0;color:#444;'>"
-            f"<b>Trend:</b> {r.trend}<br>"
-            f"<b>Rationale:</b> {r.rationale}<br>"
-            f"<b>Last:</b> {_fmt(r.last)} {r.unit} &nbsp;"
-            f"<b>SMA20:</b> {_fmt(r.sma20)} &nbsp;"
-            f"<b>SMA50:</b> {_fmt(r.sma50)}<br>"
-            f"<b>1-day forecast:</b> {_fmt(r.forecast_1d)}{fc_1d_direction} &nbsp;"
-            f"<b>7-day forecast:</b> {_fmt(r.forecast_7d)}{fc_7d_direction}"
-            f"</p>"
+            f"<div style='background:{signal_bg};border:1px solid {signal_border};border-radius:8px;"
+            f"padding:12px 16px;margin-bottom:12px;'>"
+            f"<h3 style='margin:0 0 8px 0;'>{r.name} &mdash; {_badge(r.signal)} "
+            f"<small style='color:{_strength_color(r.signal_strength)};'>{r.signal_strength}</small></h3>"
+            f"<table cellpadding='4' cellspacing='0' style='font-size:13px;'>"
+            f"<tr><td><b>Current Price:</b></td><td>{_fmt(r.last)} {r.unit}</td>"
+            f"<td width='20'></td>"
+            f"<td><b>SMA20:</b></td><td>{_fmt(r.sma20)}</td>"
+            f"<td width='20'></td>"
+            f"<td><b>SMA50:</b></td><td>{_fmt(r.sma50)}</td></tr>"
+            f"<tr><td><b>RSI(14):</b></td><td>{_fmt(r.rsi14, 0)}</td>"
+            f"<td></td>"
+            f"<td><b>MACD:</b></td><td>{_fmt(r.macd_line, 4)}</td>"
+            f"<td></td>"
+            f"<td><b>MACD Signal:</b></td><td>{_fmt(r.macd_signal, 4)}</td></tr>"
+            f"</table>"
+            f"<p style='margin:8px 0 4px 0;'><b>Trend:</b> {r.trend}</p>"
+            f"<p style='margin:4px 0;'><b>Rationale:</b> {r.rationale}</p>"
+            f"<div style='background:#fff;border-radius:4px;padding:8px 12px;margin:8px 0;'>"
+            f"<b>1-Day Forecast:</b> {_fmt(r.forecast_1d)}{fc_1d_dir}<br>"
+            f"<b>7-Day Forecast:</b> {_fmt(r.forecast_7d)}{fc_7d_dir}"
+            f"</div>"
+            f"<p style='margin:4px 0 0 0;color:#333;'><b>Strategy:</b> {r.strategy}</p>"
+            f"</div>"
         )
 
-    error_count = sum(1 for r in reports if r.error)
     status_note = ""
     if error_count > 0:
         status_note = (
@@ -433,13 +617,15 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
 
     return f"""\
 <!doctype html>
-<html><body style="font-family:Arial,Helvetica,sans-serif;color:#222;max-width:900px;margin:auto;">
-  <h2 style="margin-bottom:0;">Daily Grain &amp; Livestock Report</h2>
+<html><body style="font-family:Arial,Helvetica,sans-serif;color:#222;max-width:900px;margin:auto;padding:16px;">
+  <h2 style="margin-bottom:0;">Daily Grain &amp; Livestock Market Report</h2>
   <p style="margin-top:4px;color:#666;">
     Generated {run_ts.strftime('%A, %B %d, %Y at %H:%M UTC')}
   </p>
   {status_note}
+  {summary_html}
 
+  <h3>Price Summary &amp; Signals</h3>
   <table cellpadding="6" cellspacing="0" border="0"
          style="border-collapse:collapse;width:100%;font-size:13px;">
     <thead>
@@ -448,23 +634,23 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
         <th align="right">Last</th>
         <th align="right">1d %</th>
         <th align="right">7d %</th>
-        <th align="right">30d %</th>
         <th align="right">RSI</th>
         <th align="left">Trend</th>
         <th align="left">Signal</th>
-        <th align="right">Forecast</th>
+        <th align="right">1d Forecast</th>
+        <th align="right">7d Forecast</th>
       </tr>
     </thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
 
-  <h3 style="margin-top:24px;">Detailed Analysis &amp; Strategy</h3>
+  <h3 style="margin-top:24px;">Detailed Analysis, Forecasts &amp; Strategy</h3>
   {''.join(details)}
 
   <hr>
   <p style="color:#888;font-size:11px;">
     Prices are end-of-day from Yahoo Finance and may be delayed.
-    Signals are based on simple SMA crossover and RSI(14) rules; forecasts are
+    Signals are based on SMA crossover, RSI(14), and MACD rules; forecasts are
     linear extrapolations of the last 20 closes. This is an automated
     summary, <b>not financial advice</b>. Do your own research before trading.
     Sheep/Lamb uses the iPath Bloomberg Livestock ETN (COW) as a proxy
@@ -475,11 +661,17 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
 
 
 def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
+    buy_count = sum(1 for r in reports if r.signal == "BUY" and not r.error)
+    sell_count = sum(1 for r in reports if r.signal == "SELL" and not r.error)
+    hold_count = sum(1 for r in reports if r.signal == "HOLD" and not r.error)
+
     lines = [
-        "=" * 60,
-        "   Daily Grain & Livestock Report",
+        "=" * 65,
+        "   Daily Grain & Livestock Market Report",
         f"   Generated {run_ts.strftime('%A, %B %d, %Y at %H:%M UTC')}",
-        "=" * 60,
+        "=" * 65,
+        "",
+        f"   MARKET OVERVIEW: BUY={buy_count}  HOLD={hold_count}  SELL={sell_count}",
         "",
     ]
     for r in reports:
@@ -487,31 +679,35 @@ def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
             lines.append(f"  {r.name} ({r.symbol}): DATA UNAVAILABLE - {r.error}")
             lines.append("")
             continue
+
         fc_1d_dir = ""
-        if r.forecast_1d is not None and r.last is not None:
-            fc_1d_dir = " (higher)" if r.forecast_1d > r.last else " (lower)"
+        if r.forecast_1d_pct is not None:
+            fc_1d_dir = f" ({'+' if r.forecast_1d_pct >= 0 else ''}{r.forecast_1d_pct:.2f}%)"
         fc_7d_dir = ""
-        if r.forecast_7d is not None and r.last is not None:
-            fc_7d_dir = " (higher)" if r.forecast_7d > r.last else " (lower)"
+        if r.forecast_7d_pct is not None:
+            fc_7d_dir = f" ({'+' if r.forecast_7d_pct >= 0 else ''}{r.forecast_7d_pct:.2f}%)"
+
         lines += [
-            f"--- {r.name} ({r.symbol}) {_signal_emoji(r.signal)} ---",
-            f"  Last Price: {_fmt(r.last)} {r.unit}",
-            f"  Changes:    1d {_fmt(r.change_pct_1d, 2, '%')}  |  "
+            f"--- {r.name} ({r.symbol}) {_signal_emoji(r.signal)} {r.signal_strength} ---",
+            f"  Last Price:   {_fmt(r.last)} {r.unit}",
+            f"  Changes:      1d {_fmt(r.change_pct_1d, 2, '%')}  |  "
             f"7d {_fmt(r.change_pct_7d, 2, '%')}  |  "
             f"30d {_fmt(r.change_pct_30d, 2, '%')}",
-            f"  SMA20/50:   {_fmt(r.sma20)} / {_fmt(r.sma50)}",
-            f"  RSI(14):    {_fmt(r.rsi14, 0)}",
-            f"  Trend:      {r.trend}",
-            f"  Signal:     {r.signal}  ({r.rationale})",
-            f"  Forecast:   1d -> {_fmt(r.forecast_1d)}{fc_1d_dir}  |  "
-            f"7d -> {_fmt(r.forecast_7d)}{fc_7d_dir}",
+            f"  SMA20/50:     {_fmt(r.sma20)} / {_fmt(r.sma50)}",
+            f"  RSI(14):      {_fmt(r.rsi14, 0)}",
+            f"  MACD:         {_fmt(r.macd_line, 4)}  Signal: {_fmt(r.macd_signal, 4)}  Hist: {_fmt(r.macd_histogram, 4)}",
+            f"  Trend:        {r.trend}",
+            f"  Signal:       {r.signal} ({r.signal_strength})  -- {r.rationale}",
+            f"  1-Day Fcst:   {_fmt(r.forecast_1d)}{fc_1d_dir}",
+            f"  7-Day Fcst:   {_fmt(r.forecast_7d)}{fc_7d_dir}",
+            f"  Strategy:     {r.strategy}",
             "",
         ]
     lines += [
-        "-" * 60,
+        "-" * 65,
         "Prices from Yahoo Finance (end-of-day, may be delayed).",
-        "Signals use SMA crossover + RSI rules. NOT financial advice.",
-        "-" * 60,
+        "Signals use SMA crossover + RSI + MACD rules. NOT financial advice.",
+        "-" * 65,
     ]
     return "\n".join(lines)
 
@@ -559,7 +755,6 @@ def main() -> int:
     print(f"Run time: {run_ts.isoformat()}")
     print()
 
-    # Initialize Yahoo session once before fetching instruments.
     try:
         print("Initializing Yahoo Finance session...", end=" ", flush=True)
         _init_yahoo_session()
@@ -577,7 +772,6 @@ def main() -> int:
         else:
             print(f"OK - {_fmt(report.last)} {unit}")
         reports.append(report)
-        # Rate-limit: pause between instruments to avoid Yahoo throttling.
         if i < len(INSTRUMENTS) - 1:
             time.sleep(1.5)
 

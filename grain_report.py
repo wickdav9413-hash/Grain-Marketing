@@ -2,12 +2,12 @@
 Daily Grain & Livestock Market Report.
 
 Fetches recent prices for corn, soybeans, wheat, milk, live cattle (beef),
-lean hogs, and sheep/lamb, computes simple technical indicators, generates
-buy/sell signals and 1-/7-day forecasts, then emails the report.
+lean hogs, and sheep/lamb, computes technical indicators (SMA, RSI, MACD),
+generates buy/sell signals and 1-/7-day forecasts, then emails the report.
 
 Data sources (in priority order):
-  1. Yahoo Finance chart API via requests (with cookie/crumb auth)
-  2. yfinance library (fallback)
+  1. yfinance library (most reliable with recent versions)
+  2. Yahoo Finance chart API via requests (with cookie/crumb auth)
   3. Yahoo Finance CSV download endpoint (last resort)
 
 Email: SMTP (Gmail app password expected).
@@ -31,7 +31,7 @@ import smtplib
 import ssl
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Optional
@@ -63,6 +63,9 @@ class InstrumentReport:
     sma20: Optional[float]
     sma50: Optional[float]
     rsi14: Optional[float]
+    macd: Optional[float]
+    macd_signal: Optional[float]
+    macd_histogram: Optional[float]
     trend: str
     signal: str
     rationale: str
@@ -148,16 +151,26 @@ def _fetch_yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d"
 
 
 def _fetch_yfinance(symbol: str) -> pd.Series:
-    """Fallback: use the yfinance library."""
+    """Primary source: use the yfinance library."""
     import yfinance as yf
 
     ticker = yf.Ticker(symbol)
-    hist = ticker.history(period="6mo", interval="1d")
-    if hist is None or hist.empty:
+    try:
+        hist = ticker.history(period="6mo", interval="1d", raise_errors=True)
+    except TypeError:
+        hist = ticker.history(period="6mo", interval="1d")
+    except Exception:
+        hist = ticker.history(period="6mo", interval="1d")
+    if hist is None or not isinstance(hist, pd.DataFrame) or hist.empty:
         raise RuntimeError("yfinance returned no data")
-    if "Close" not in hist.columns:
-        raise RuntimeError("yfinance returned no Close column")
-    closes = hist["Close"].dropna()
+    close_col = None
+    for col in hist.columns:
+        if str(col).lower() == "close":
+            close_col = col
+            break
+    if close_col is None:
+        raise RuntimeError(f"yfinance returned no Close column, got: {list(hist.columns)}")
+    closes = hist[close_col].dropna().astype(float)
     if closes.empty:
         raise RuntimeError("yfinance Close series is empty")
     return closes
@@ -197,8 +210,8 @@ def fetch_closes(symbol: str) -> pd.Series:
     errors = []
 
     for fetcher_name, fetcher in [
-        ("yahoo_chart_api", _fetch_yahoo_chart),
         ("yfinance", _fetch_yfinance),
+        ("yahoo_chart_api", _fetch_yahoo_chart),
         ("yahoo_csv", _fetch_yahoo_csv),
     ]:
         try:
@@ -238,6 +251,18 @@ def _pct_change(series: pd.Series, days: int) -> Optional[float]:
     return float((new - old) / old * 100)
 
 
+def _macd(series: pd.Series) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Compute MACD(12,26,9). Returns (macd_line, signal_line, histogram)."""
+    if len(series) < 35:
+        return None, None, None
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(histogram.iloc[-1])
+
+
 def _linear_forecast(series: pd.Series, horizon_days: int) -> Optional[float]:
     """Linear-regression extrapolation over the last 20 closes."""
     window = series.dropna().tail(20)
@@ -263,17 +288,24 @@ def _derive_signal(
     sma20: Optional[float],
     sma50: Optional[float],
     rsi: Optional[float],
+    macd_val: Optional[float],
+    macd_sig: Optional[float],
+    macd_hist: Optional[float],
 ) -> tuple[str, str, str]:
     """Return (trend, signal, rationale) from mechanical rules."""
     reasons: list[str] = []
+    buy_score = 0
+    sell_score = 0
 
     if sma20 is not None and sma50 is not None:
         if last > sma20 > sma50:
             trend = "Uptrend"
             reasons.append("price > SMA20 > SMA50")
+            buy_score += 1
         elif last < sma20 < sma50:
             trend = "Downtrend"
             reasons.append("price < SMA20 < SMA50")
+            sell_score += 1
         elif last > sma50:
             trend = "Weak uptrend"
             reasons.append("price above SMA50")
@@ -283,24 +315,44 @@ def _derive_signal(
     else:
         trend = "Unknown"
 
-    signal = "HOLD"
     if rsi is not None:
         if rsi < 30:
-            signal = "BUY"
+            buy_score += 2
             reasons.append(f"RSI {rsi:.0f} (oversold)")
         elif rsi > 70:
-            signal = "SELL"
+            sell_score += 2
             reasons.append(f"RSI {rsi:.0f} (overbought)")
         else:
             reasons.append(f"RSI {rsi:.0f} (neutral)")
 
-    if signal == "HOLD" and sma20 is not None and sma50 is not None:
+    if macd_val is not None and macd_sig is not None and macd_hist is not None:
+        if macd_hist > 0 and macd_val > macd_sig:
+            buy_score += 1
+            reasons.append("MACD bullish (above signal)")
+        elif macd_hist < 0 and macd_val < macd_sig:
+            sell_score += 1
+            reasons.append("MACD bearish (below signal)")
+        else:
+            reasons.append("MACD neutral")
+
+    if sma20 is not None and sma50 is not None:
         if sma20 > sma50 and last > sma20:
-            signal = "BUY"
-            reasons.append("bullish SMA crossover with price above SMA20")
+            buy_score += 1
+            reasons.append("bullish SMA crossover")
         elif sma20 < sma50 and last < sma20:
-            signal = "SELL"
-            reasons.append("bearish SMA crossover with price below SMA20")
+            sell_score += 1
+            reasons.append("bearish SMA crossover")
+
+    if buy_score >= 2:
+        signal = "BUY"
+    elif sell_score >= 2:
+        signal = "SELL"
+    elif buy_score > sell_score:
+        signal = "BUY"
+    elif sell_score > buy_score:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
 
     return trend, signal, "; ".join(reasons) if reasons else "insufficient data"
 
@@ -311,6 +363,7 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         last=None, prev_close=None,
         change_pct_1d=None, change_pct_7d=None, change_pct_30d=None,
         sma20=None, sma50=None, rsi14=None,
+        macd=None, macd_signal=None, macd_histogram=None,
         trend="Unknown", signal="HOLD",
         rationale="no data", forecast_1d=None, forecast_7d=None,
     )
@@ -329,7 +382,8 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
     sma20 = float(closes.tail(20).mean()) if len(closes) >= 20 else None
     sma50 = float(closes.tail(50).mean()) if len(closes) >= 50 else None
     rsi14 = _rsi(closes)
-    trend, signal, rationale = _derive_signal(last, sma20, sma50, rsi14)
+    macd_val, macd_sig, macd_hist = _macd(closes)
+    trend, signal, rationale = _derive_signal(last, sma20, sma50, rsi14, macd_val, macd_sig, macd_hist)
 
     return InstrumentReport(
         name=name,
@@ -343,6 +397,9 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         sma20=sma20,
         sma50=sma50,
         rsi14=rsi14,
+        macd=macd_val,
+        macd_signal=macd_sig,
+        macd_histogram=macd_hist,
         trend=trend,
         signal=signal,
         rationale=rationale,
@@ -358,6 +415,42 @@ def _fmt(value: Optional[float], places: int = 2, suffix: str = "") -> str:
     if value is None:
         return "n/a"
     return f"{value:,.{places}f}{suffix}"
+
+
+def _strategy_text(r: InstrumentReport) -> str:
+    """Generate plain-English strategy advice based on signal and indicators."""
+    if r.error or r.last is None:
+        return "Insufficient data for strategy recommendation."
+
+    parts = []
+    if r.signal == "BUY":
+        parts.append(f"{r.name} is showing buying conditions.")
+        if r.rsi14 is not None and r.rsi14 < 30:
+            parts.append("RSI indicates oversold territory - potential reversal upward.")
+        if r.macd_histogram is not None and r.macd_histogram > 0:
+            parts.append("MACD momentum is positive, supporting upward movement.")
+        if r.forecast_7d is not None and r.forecast_7d > r.last:
+            pct = (r.forecast_7d - r.last) / r.last * 100
+            parts.append(f"7-day forecast projects +{pct:.1f}% gain.")
+        parts.append("Consider entering long positions or accumulating.")
+    elif r.signal == "SELL":
+        parts.append(f"{r.name} is showing selling conditions.")
+        if r.rsi14 is not None and r.rsi14 > 70:
+            parts.append("RSI indicates overbought territory - potential pullback.")
+        if r.macd_histogram is not None and r.macd_histogram < 0:
+            parts.append("MACD momentum is negative, supporting downward pressure.")
+        if r.forecast_7d is not None and r.forecast_7d < r.last:
+            pct = (r.last - r.forecast_7d) / r.last * 100
+            parts.append(f"7-day forecast projects -{pct:.1f}% decline.")
+        parts.append("Consider reducing exposure or taking profits.")
+    else:
+        parts.append(f"{r.name} is in a neutral zone. No strong directional signal.")
+        if r.forecast_7d is not None:
+            direction = "upward" if r.forecast_7d > r.last else "downward"
+            parts.append(f"7-day forecast leans {direction}.")
+        parts.append("Hold current positions and watch for a breakout.")
+
+    return " ".join(parts)
 
 
 def _badge(signal: str) -> str:
@@ -378,12 +471,14 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
         if r.error:
             rows.append(
                 f"<tr><td><b>{r.name}</b><br><small>{r.symbol}</small></td>"
-                f"<td colspan='8' style='color:#b42318;'>Data unavailable: {r.error}</td></tr>"
+                f"<td colspan='9' style='color:#b42318;'>Data unavailable: {r.error}</td></tr>"
             )
             continue
         chg_color_1d = "#1a7f37" if (r.change_pct_1d or 0) >= 0 else "#b42318"
         chg_color_7d = "#1a7f37" if (r.change_pct_7d or 0) >= 0 else "#b42318"
         chg_color_30d = "#1a7f37" if (r.change_pct_30d or 0) >= 0 else "#b42318"
+        macd_color = "#1a7f37" if (r.macd_histogram or 0) > 0 else "#b42318"
+        macd_cell = f"<span style='color:{macd_color};'>{_fmt(r.macd_histogram, 3)}</span>" if r.macd_histogram is not None else "n/a"
         rows.append(
             "<tr>"
             f"<td><b>{r.name}</b><br><small>{r.symbol} &middot; {r.unit}</small></td>"
@@ -392,6 +487,7 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
             f"<td style='text-align:right;color:{chg_color_7d};'>{_fmt(r.change_pct_7d, 2, '%')}</td>"
             f"<td style='text-align:right;color:{chg_color_30d};'>{_fmt(r.change_pct_30d, 2, '%')}</td>"
             f"<td style='text-align:right;'>{_fmt(r.rsi14, 0)}</td>"
+            f"<td style='text-align:right;'>{macd_cell}</td>"
             f"<td>{r.trend}</td>"
             f"<td>{_badge(r.signal)}</td>"
             f"<td style='text-align:right;'>{_fmt(r.forecast_1d)}<br>"
@@ -409,6 +505,19 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
         fc_7d_direction = ""
         if r.forecast_7d is not None and r.last is not None:
             fc_7d_direction = " (higher)" if r.forecast_7d > r.last else " (lower)"
+
+        strategy = _strategy_text(r)
+
+        macd_line = ""
+        if r.macd is not None:
+            macd_color = "#1a7f37" if (r.macd_histogram or 0) > 0 else "#b42318"
+            macd_line = (
+                f"<b>MACD:</b> <span style='color:{macd_color};'>"
+                f"{_fmt(r.macd, 3)}</span> &nbsp;"
+                f"<b>Signal:</b> {_fmt(r.macd_signal, 3)} &nbsp;"
+                f"<b>Histogram:</b> {_fmt(r.macd_histogram, 3)}<br>"
+            )
+
         details.append(
             f"<h3 style='margin-bottom:4px;'>{r.name} &mdash; {_badge(r.signal)}</h3>"
             f"<p style='margin-top:0;color:#444;'>"
@@ -417,8 +526,10 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
             f"<b>Last:</b> {_fmt(r.last)} {r.unit} &nbsp;"
             f"<b>SMA20:</b> {_fmt(r.sma20)} &nbsp;"
             f"<b>SMA50:</b> {_fmt(r.sma50)}<br>"
+            f"{macd_line}"
             f"<b>1-day forecast:</b> {_fmt(r.forecast_1d)}{fc_1d_direction} &nbsp;"
-            f"<b>7-day forecast:</b> {_fmt(r.forecast_7d)}{fc_7d_direction}"
+            f"<b>7-day forecast:</b> {_fmt(r.forecast_7d)}{fc_7d_direction}<br>"
+            f"<b>Strategy:</b> {strategy}"
             f"</p>"
         )
 
@@ -450,6 +561,7 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
         <th align="right">7d %</th>
         <th align="right">30d %</th>
         <th align="right">RSI</th>
+        <th align="right">MACD</th>
         <th align="left">Trend</th>
         <th align="left">Signal</th>
         <th align="right">Forecast</th>
@@ -464,11 +576,12 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
   <hr>
   <p style="color:#888;font-size:11px;">
     Prices are end-of-day from Yahoo Finance and may be delayed.
-    Signals are based on simple SMA crossover and RSI(14) rules; forecasts are
-    linear extrapolations of the last 20 closes. This is an automated
-    summary, <b>not financial advice</b>. Do your own research before trading.
-    Sheep/Lamb uses the iPath Bloomberg Livestock ETN (COW) as a proxy
-    because no public sheep futures contract is available on Yahoo Finance.
+    Signals are based on SMA crossover, RSI(14), and MACD(12,26,9) rules;
+    forecasts are linear extrapolations of the last 20 closes. This is an
+    automated summary, <b>not financial advice</b>. Do your own research
+    before trading. Sheep/Lamb uses the iPath Bloomberg Livestock ETN (COW)
+    as a proxy because no public sheep futures contract is available on
+    Yahoo Finance.
   </p>
 </body></html>
 """
@@ -493,6 +606,13 @@ def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
         fc_7d_dir = ""
         if r.forecast_7d is not None and r.last is not None:
             fc_7d_dir = " (higher)" if r.forecast_7d > r.last else " (lower)"
+        macd_line = ""
+        if r.macd is not None:
+            macd_line = (
+                f"  MACD:       {_fmt(r.macd, 3)} / Signal: {_fmt(r.macd_signal, 3)}"
+                f" / Hist: {_fmt(r.macd_histogram, 3)}"
+            )
+        strategy = _strategy_text(r)
         lines += [
             f"--- {r.name} ({r.symbol}) {_signal_emoji(r.signal)} ---",
             f"  Last Price: {_fmt(r.last)} {r.unit}",
@@ -501,16 +621,21 @@ def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
             f"30d {_fmt(r.change_pct_30d, 2, '%')}",
             f"  SMA20/50:   {_fmt(r.sma20)} / {_fmt(r.sma50)}",
             f"  RSI(14):    {_fmt(r.rsi14, 0)}",
+        ]
+        if macd_line:
+            lines.append(macd_line)
+        lines += [
             f"  Trend:      {r.trend}",
             f"  Signal:     {r.signal}  ({r.rationale})",
             f"  Forecast:   1d -> {_fmt(r.forecast_1d)}{fc_1d_dir}  |  "
             f"7d -> {_fmt(r.forecast_7d)}{fc_7d_dir}",
+            f"  Strategy:   {strategy}",
             "",
         ]
     lines += [
         "-" * 60,
         "Prices from Yahoo Finance (end-of-day, may be delayed).",
-        "Signals use SMA crossover + RSI rules. NOT financial advice.",
+        "Signals use SMA crossover, RSI, and MACD rules. NOT financial advice.",
         "-" * 60,
     ]
     return "\n".join(lines)

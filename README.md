@@ -91,17 +91,25 @@ The workflow needs a few GitHub secrets before it can send email.
 ## How the signals work
 
 The script is deliberately simple and transparent - no black box.
+Signals use a scoring system across three indicators:
 
 - **Trend**: compares last price to SMA20 and SMA50.
-  - `price > SMA20 > SMA50` -> uptrend
-  - `price < SMA20 < SMA50` -> downtrend
+  - `price > SMA20 > SMA50` -> uptrend (+1 buy)
+  - `price < SMA20 < SMA50` -> downtrend (+1 sell)
   - otherwise -> weak up/down based on SMA50
-- **Signal**:
-  - RSI(14) below 30 -> **BUY** (oversold)
-  - RSI(14) above 70 -> **SELL** (overbought)
-  - Otherwise a bullish SMA crossover with price above SMA20 -> **BUY**
-  - A bearish SMA crossover with price below SMA20 -> **SELL**
-  - Else **HOLD**
+- **RSI(14)**:
+  - Below 30 -> oversold (+2 buy)
+  - Above 70 -> overbought (+2 sell)
+- **MACD(12,26,9)**:
+  - MACD above signal line with positive histogram -> bullish (+1 buy)
+  - MACD below signal line with negative histogram -> bearish (+1 sell)
+- **SMA crossover**:
+  - SMA20 > SMA50 with price above SMA20 -> bullish (+1 buy)
+  - SMA20 < SMA50 with price below SMA20 -> bearish (+1 sell)
+- **Final signal**: BUY if buy score >= 2 or > sell score; SELL if
+  sell score >= 2 or > buy score; otherwise HOLD.
+- **Strategy**: each instrument gets a plain-English strategy note
+  explaining what the combined signals suggest.
 - **Forecasts**: linear least-squares fit of the last 20 closes,
   projected 1 and 5 trading days ahead.
 

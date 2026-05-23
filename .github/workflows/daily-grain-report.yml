@@ -3,6 +3,7 @@ name: Daily Grain & Livestock Report
 on:
   schedule:
     # 11:30 UTC = 06:30 Central (after CBOT open, before most users start the day).
+    # Runs Mon-Fri. Weekend data is stale, so we skip Sat/Sun.
     - cron: "30 11 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -43,3 +44,18 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python grain_report.py
+
+      - name: Retry on failure
+        if: failure()
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          echo "First attempt failed. Retrying after 30 seconds..."
+          sleep 30
+          python grain_report.py

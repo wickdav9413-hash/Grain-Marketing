@@ -2,7 +2,7 @@
 Daily Grain & Livestock Market Report.
 
 Fetches recent prices for corn, soybeans, wheat, milk, live cattle (beef),
-lean hogs, and sheep/lamb, computes simple technical indicators, generates
+lean hogs, and feeder cattle, computes simple technical indicators, generates
 buy/sell signals and 1-/7-day forecasts, then emails the report.
 
 Data sources (in priority order):
@@ -46,7 +46,7 @@ INSTRUMENTS: list[tuple[str, str, str]] = [
     ("Class III Milk", "DC=F", "USD / cwt"),
     ("Live Cattle (Beef)", "LE=F", "USD / lb"),
     ("Lean Hogs", "HE=F", "USD / lb"),
-    ("Sheep/Lamb (proxy: Livestock ETF COW)", "COW", "USD / share"),
+    ("Feeder Cattle", "GF=F", "USD / lb"),
 ]
 
 
@@ -467,8 +467,6 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
     Signals are based on simple SMA crossover and RSI(14) rules; forecasts are
     linear extrapolations of the last 20 closes. This is an automated
     summary, <b>not financial advice</b>. Do your own research before trading.
-    Sheep/Lamb uses the iPath Bloomberg Livestock ETN (COW) as a proxy
-    because no public sheep futures contract is available on Yahoo Finance.
   </p>
 </body></html>
 """

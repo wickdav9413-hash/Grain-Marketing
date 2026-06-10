@@ -66,6 +66,7 @@ class InstrumentReport:
     trend: str
     signal: str
     rationale: str
+    strategy: str
     forecast_1d: Optional[float]
     forecast_7d: Optional[float]
     error: Optional[str] = None
@@ -263,8 +264,11 @@ def _derive_signal(
     sma20: Optional[float],
     sma50: Optional[float],
     rsi: Optional[float],
-) -> tuple[str, str, str]:
-    """Return (trend, signal, rationale) from mechanical rules."""
+    change_pct_7d: Optional[float] = None,
+    forecast_1d: Optional[float] = None,
+    forecast_7d: Optional[float] = None,
+) -> tuple[str, str, str, str]:
+    """Return (trend, signal, rationale, strategy) from mechanical rules."""
     reasons: list[str] = []
 
     if sma20 is not None and sma50 is not None:
@@ -302,7 +306,60 @@ def _derive_signal(
             signal = "SELL"
             reasons.append("bearish SMA crossover with price below SMA20")
 
-    return trend, signal, "; ".join(reasons) if reasons else "insufficient data"
+    strategy = _build_strategy(signal, trend, rsi, change_pct_7d, forecast_1d, forecast_7d, last)
+
+    return trend, signal, "; ".join(reasons) if reasons else "insufficient data", strategy
+
+
+def _build_strategy(
+    signal: str,
+    trend: str,
+    rsi: Optional[float],
+    change_pct_7d: Optional[float],
+    forecast_1d: Optional[float],
+    forecast_7d: Optional[float],
+    last: float,
+) -> str:
+    """Generate actionable strategy text based on the signal and indicators."""
+    parts: list[str] = []
+
+    if signal == "BUY":
+        parts.append("STRATEGY: Consider entering a long position or accumulating.")
+        if rsi is not None and rsi < 30:
+            parts.append("RSI indicates oversold conditions — potential bounce ahead.")
+        if "Uptrend" in trend:
+            parts.append("Momentum is aligned to the upside; buying with the trend.")
+        elif "Downtrend" in trend:
+            parts.append("Contrarian buy into weakness — use tight stops.")
+    elif signal == "SELL":
+        parts.append("STRATEGY: Consider reducing exposure or taking profits.")
+        if rsi is not None and rsi > 70:
+            parts.append("RSI shows overbought conditions — pullback risk is elevated.")
+        if "Downtrend" in trend:
+            parts.append("Selling pressure is dominant; protect downside.")
+        elif "Uptrend" in trend:
+            parts.append("Selling into strength — lock in gains before a reversal.")
+    else:
+        parts.append("STRATEGY: Hold current positions; wait for a clearer signal.")
+        if rsi is not None:
+            if 45 <= rsi <= 55:
+                parts.append("Market is range-bound. Watch for a breakout above SMA20 or breakdown below SMA50.")
+            elif rsi > 55:
+                parts.append("Leaning bullish — a break above SMA20 could trigger a BUY.")
+            else:
+                parts.append("Leaning bearish — a drop below SMA50 could trigger a SELL.")
+
+    if forecast_1d is not None and forecast_7d is not None:
+        fc_1d_pct = (forecast_1d - last) / last * 100
+        fc_7d_pct = (forecast_7d - last) / last * 100
+        if fc_1d_pct > 0 and fc_7d_pct > 0:
+            parts.append(f"Forecast is bullish: +{fc_1d_pct:.1f}% (1d), +{fc_7d_pct:.1f}% (7d).")
+        elif fc_1d_pct < 0 and fc_7d_pct < 0:
+            parts.append(f"Forecast is bearish: {fc_1d_pct:.1f}% (1d), {fc_7d_pct:.1f}% (7d).")
+        else:
+            parts.append("Mixed forecast — short-term and medium-term trends diverge. Exercise caution.")
+
+    return " ".join(parts)
 
 
 def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
@@ -312,7 +369,8 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         change_pct_1d=None, change_pct_7d=None, change_pct_30d=None,
         sma20=None, sma50=None, rsi14=None,
         trend="Unknown", signal="HOLD",
-        rationale="no data", forecast_1d=None, forecast_7d=None,
+        rationale="no data", strategy="No data available.",
+        forecast_1d=None, forecast_7d=None,
     )
     try:
         closes = fetch_closes(symbol)
@@ -329,7 +387,12 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
     sma20 = float(closes.tail(20).mean()) if len(closes) >= 20 else None
     sma50 = float(closes.tail(50).mean()) if len(closes) >= 50 else None
     rsi14 = _rsi(closes)
-    trend, signal, rationale = _derive_signal(last, sma20, sma50, rsi14)
+    change_pct_7d = _pct_change(closes, 5)
+    forecast_1d = _linear_forecast(closes, 1)
+    forecast_7d = _linear_forecast(closes, 5)
+    trend, signal, rationale, strategy = _derive_signal(
+        last, sma20, sma50, rsi14, change_pct_7d, forecast_1d, forecast_7d,
+    )
 
     return InstrumentReport(
         name=name,
@@ -338,7 +401,7 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         last=last,
         prev_close=prev,
         change_pct_1d=_pct_change(closes, 1),
-        change_pct_7d=_pct_change(closes, 5),
+        change_pct_7d=change_pct_7d,
         change_pct_30d=_pct_change(closes, 21),
         sma20=sma20,
         sma50=sma50,
@@ -346,8 +409,9 @@ def analyze(name: str, symbol: str, unit: str) -> InstrumentReport:
         trend=trend,
         signal=signal,
         rationale=rationale,
-        forecast_1d=_linear_forecast(closes, 1),
-        forecast_7d=_linear_forecast(closes, 5),
+        strategy=strategy,
+        forecast_1d=forecast_1d,
+        forecast_7d=forecast_7d,
     )
 
 
@@ -366,6 +430,10 @@ def _badge(signal: str) -> str:
         f'<span style="background:{colour};color:#fff;padding:2px 8px;'
         f'border-radius:10px;font-weight:600;font-size:12px;">{signal}</span>'
     )
+
+
+def _signal_color(signal: str) -> str:
+    return {"BUY": "#1a7f37", "SELL": "#b42318", "HOLD": "#6c6c6c"}.get(signal, "#6c6c6c")
 
 
 def _signal_emoji(signal: str) -> str:
@@ -420,6 +488,9 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
             f"<b>1-day forecast:</b> {_fmt(r.forecast_1d)}{fc_1d_direction} &nbsp;"
             f"<b>7-day forecast:</b> {_fmt(r.forecast_7d)}{fc_7d_direction}"
             f"</p>"
+            f"<p style='margin-top:2px;padding:8px 12px;background:#f8f9fa;"
+            f"border-left:3px solid {_signal_color(r.signal)};color:#333;'>"
+            f"{r.strategy}</p>"
         )
 
     error_count = sum(1 for r in reports if r.error)
@@ -505,6 +576,7 @@ def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
             f"  Signal:     {r.signal}  ({r.rationale})",
             f"  Forecast:   1d -> {_fmt(r.forecast_1d)}{fc_1d_dir}  |  "
             f"7d -> {_fmt(r.forecast_7d)}{fc_7d_dir}",
+            f"  Strategy:   {r.strategy}",
             "",
         ]
     lines += [

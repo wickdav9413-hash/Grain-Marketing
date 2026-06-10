@@ -2,8 +2,9 @@ name: Daily Grain & Livestock Report
 
 on:
   schedule:
-    # 11:30 UTC = 06:30 Central (after CBOT open, before most users start the day).
-    - cron: "30 11 * * 1-5"
+    # 11:30 UTC = 06:30 Central every day.
+    # Weekend reports use Friday's close (markets closed Sat/Sun).
+    - cron: "30 11 * * *"
   workflow_dispatch:
     inputs:
       dry_run:

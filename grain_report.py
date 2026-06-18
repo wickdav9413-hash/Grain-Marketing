@@ -46,8 +46,15 @@ INSTRUMENTS: list[tuple[str, str, str]] = [
     ("Class III Milk", "DC=F", "USD / cwt"),
     ("Live Cattle (Beef)", "LE=F", "USD / lb"),
     ("Lean Hogs", "HE=F", "USD / lb"),
-    ("Sheep/Lamb (proxy: Livestock ETF COW)", "COW", "USD / share"),
+    ("Feeder Cattle", "GF=F", "USD / lb"),
 ]
+
+SHEEP_NOTE = (
+    "Sheep/Lamb: No publicly traded futures contract is available on major exchanges. "
+    "For current lamb prices, see the USDA National Direct Sheep Report at "
+    "https://mymarketnews.ams.usda.gov/viewReport/2907 and the weekly summary at "
+    "https://www.ams.usda.gov/mnreports/lswlamb.pdf"
+)
 
 
 @dataclass
@@ -461,14 +468,19 @@ def render_html(reports: list[InstrumentReport], run_ts: datetime) -> str:
   <h3 style="margin-top:24px;">Detailed Analysis &amp; Strategy</h3>
   {''.join(details)}
 
+  <h3 style="margin-top:24px;">Sheep / Lamb Prices</h3>
+  <p style="color:#444;font-size:13px;">
+    {SHEEP_NOTE}<br>
+    <a href="https://mymarketnews.ams.usda.gov/viewReport/2907">USDA National Direct Sheep Report</a> &middot;
+    <a href="https://www.ams.usda.gov/mnreports/lswlamb.pdf">Weekly Lamb Market Summary (PDF)</a>
+  </p>
+
   <hr>
   <p style="color:#888;font-size:11px;">
     Prices are end-of-day from Yahoo Finance and may be delayed.
     Signals are based on simple SMA crossover and RSI(14) rules; forecasts are
     linear extrapolations of the last 20 closes. This is an automated
     summary, <b>not financial advice</b>. Do your own research before trading.
-    Sheep/Lamb uses the iPath Bloomberg Livestock ETN (COW) as a proxy
-    because no public sheep futures contract is available on Yahoo Finance.
   </p>
 </body></html>
 """
@@ -508,6 +520,10 @@ def render_text(reports: list[InstrumentReport], run_ts: datetime) -> str:
             "",
         ]
     lines += [
+        "",
+        "SHEEP / LAMB PRICES",
+        SHEEP_NOTE,
+        "",
         "-" * 60,
         "Prices from Yahoo Finance (end-of-day, may be delayed).",
         "Signals use SMA crossover + RSI rules. NOT financial advice.",

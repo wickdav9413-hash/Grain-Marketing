@@ -31,12 +31,13 @@ financial advice**.
 | Class III Milk       | `DC=F`  | CME Class III milk futures             |
 | Live Cattle (Beef)   | `LE=F`  | CME live cattle futures                |
 | Lean Hogs            | `HE=F`  | CME lean hogs futures                  |
-| Sheep / Lamb (proxy) | `COW`   | iPath Bloomberg Livestock ETN - proxy  |
+| Feeder Cattle        | `GF=F`  | CME feeder cattle futures              |
 
-> Yahoo Finance does not offer a public sheep or lamb futures contract,
-> so we use the iPath Bloomberg Livestock ETN (COW) as a proxy for
-> livestock prices including lamb. If you have a paid data source for
-> real lamb prices, swap the symbol in `grain_report.py` under `INSTRUMENTS`.
+> Yahoo Finance does not offer a public sheep or lamb futures contract.
+> Feeder Cattle (GF=F) is included as a livestock proxy. For current
+> lamb prices, see the USDA National Direct Sheep Report at
+> https://mymarketnews.ams.usda.gov/viewReport/2907 and the weekly
+> summary at https://www.ams.usda.gov/mnreports/lswlamb.pdf
 
 ## One-time setup
 

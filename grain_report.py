@@ -47,6 +47,7 @@ INSTRUMENTS: list[tuple[str, str, str]] = [
     ("Live Cattle (Beef)", "LE=F", "USD / lb"),
     ("Lean Hogs", "HE=F", "USD / lb"),
     ("Feeder Cattle", "GF=F", "USD / lb"),
+    ("Sheep/Lamb (proxy)", "COW", "USD / share"),
 ]
 
 SHEEP_NOTE = (

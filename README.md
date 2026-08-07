@@ -9,7 +9,7 @@ to run on GitHub Actions once per day with no server to maintain.
 Each morning, `wickdav9413@gmail.com` receives an email containing:
 
 1. **Current prices** for Corn, Soybeans, Wheat, Class III Milk,
-   Live Cattle (beef), Lean Hogs, and a Sheep/Lamb proxy.
+   Live Cattle (beef), Lean Hogs, and Feeder Cattle.
 2. **Trend read** (uptrend / downtrend / weak) based on 20- and
    50-day simple moving averages.
 3. **Buy / Sell / Hold signal** with plain-English rationale, driven
@@ -31,12 +31,7 @@ financial advice**.
 | Class III Milk       | `DC=F`  | CME Class III milk futures             |
 | Live Cattle (Beef)   | `LE=F`  | CME live cattle futures                |
 | Lean Hogs            | `HE=F`  | CME lean hogs futures                  |
-| Sheep / Lamb (proxy) | `COW`   | iPath Bloomberg Livestock ETN - proxy  |
-
-> Yahoo Finance does not offer a public sheep or lamb futures contract,
-> so we use the iPath Bloomberg Livestock ETN (COW) as a proxy for
-> livestock prices including lamb. If you have a paid data source for
-> real lamb prices, swap the symbol in `grain_report.py` under `INSTRUMENTS`.
+| Feeder Cattle        | `GF=F`  | CME feeder cattle futures              |
 
 ## One-time setup
 

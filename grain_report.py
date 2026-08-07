@@ -2,7 +2,7 @@
 Daily Grain & Livestock Market Report.
 
 Fetches recent prices for corn, soybeans, wheat, milk, live cattle (beef),
-lean hogs, and sheep/lamb, computes simple technical indicators, generates
+lean hogs, and feeder cattle, computes simple technical indicators, generates
 buy/sell signals and 1-/7-day forecasts, then emails the report.
 
 Data sources (in priority order):
